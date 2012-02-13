@@ -260,8 +260,14 @@ TIFFOutput::open (const std::string &name, const ImageSpec &userspec,
     if ((param = m_spec.find_attribute("planarconfig", TypeDesc::STRING)) ||
         (param = m_spec.find_attribute("tiff:planarconfig", TypeDesc::STRING))) {
         str = *(char **)param->data();
-        if (str && iequals (str, "separate"))
+        if (str && iequals (str, "separate")) {
             m_planarconfig = PLANARCONFIG_SEPARATE;
+            if (! m_spec.tile_width) {
+                // I can only seem to make separate planarconfig work when
+                // rowsperstrip is 1.
+                TIFFSetField (m_tif, TIFFTAG_ROWSPERSTRIP, 1);
+            }
+        }
     }
     TIFFSetField (m_tif, TIFFTAG_PLANARCONFIG, m_planarconfig);
 
@@ -391,13 +397,17 @@ TIFFOutput::put_parameter (const std::string &name, TypeDesc type,
         TIFFSetField (m_tif, TIFFTAG_RESOLUTIONUNIT, *(unsigned int *)data);
         return true;
     }
-    if (iequals(name, "tiff:RowsPerStrip")) {
+    if (iequals(name, "tiff:RowsPerStrip")
+          && ! m_spec.tile_width /* don't set rps for tiled files */
+          && m_planarconfig == PLANARCONFIG_CONTIG /* only for contig */) {
         if (type == TypeDesc::INT) {
-            TIFFSetField (m_tif, TIFFTAG_ROWSPERSTRIP, *(int*)data);
+            TIFFSetField (m_tif, TIFFTAG_ROWSPERSTRIP,
+                          std::min (*(int*)data, m_spec.height));
             return true;
         } else if (type == TypeDesc::STRING) {
             // Back-compatibility with Entropy and PRMan
-            TIFFSetField (m_tif, TIFFTAG_ROWSPERSTRIP, atoi(*(char **)data));
+            TIFFSetField (m_tif, TIFFTAG_ROWSPERSTRIP,
+                          std::min (atoi(*(char **)data), m_spec.height));
             return true;
         }
     }
@@ -448,7 +458,7 @@ bool
 TIFFOutput::close ()
 {
     if (m_tif)
-        TIFFClose (m_tif);
+        TIFFClose (m_tif);    // N.B. TIFFClose doesn't return a status code
     init ();      // re-initialize
     return true;  // How can we fail?
 }
@@ -480,11 +490,19 @@ TIFFOutput::write_scanline (int y, int z, TypeDesc format,
     data = to_native_scanline (format, data, xstride, m_scratch);
 
     y -= m_spec.y;
-    if (m_planarconfig == PLANARCONFIG_SEPARATE && m_spec.nchannels > 1) {
+    if (m_planarconfig == PLANARCONFIG_SEPARATE) {
         // Convert from contiguous (RGBRGBRGB) to separate (RRRGGGBBB)
+        int plane_bytes = m_spec.width * m_spec.format.size();
+        std::vector<unsigned char> scratch2 (m_spec.scanline_bytes());
+        std::swap (m_scratch, scratch2);
         m_scratch.resize (m_spec.scanline_bytes());
         contig_to_separate (m_spec.width, (const unsigned char *)data, &m_scratch[0]);
-        TIFFWriteScanline (m_tif, &m_scratch[0], y);
+        for (int c = 0;  c < m_spec.nchannels;  ++c) {
+            if (TIFFWriteScanline (m_tif, (tdata_t)&m_scratch[plane_bytes*c], y, c) < 0) {
+                error ("TIFFWriteScanline failed");
+                return false;
+            }
+        }
     } else {
         // No contig->separate is necessary.  But we still use scratch
         // space since TIFFWriteScanline is destructive when
@@ -494,10 +512,14 @@ TIFFOutput::write_scanline (int y, int z, TypeDesc format,
                               (unsigned char *)data+m_spec.scanline_bytes());
             data = &m_scratch[0];
         }
-        TIFFWriteScanline (m_tif, (tdata_t)data, y);
+        if (TIFFWriteScanline (m_tif, (tdata_t)data, y) < 0) {
+            error ("TIFFWriteScanline failed");
+            return false;
+        }
     }
     
-    // Should we checkpoint? Only if we have enough scanlines and enough time has passed
+    // Should we checkpoint? Only if we have enough scanlines and enough
+    // time has passed
     if (m_checkpointTimer() > DEFAULT_CHECKPOINT_INTERVAL_SECONDS && 
         m_checkpointItems >= MIN_SCANLINES_OR_TILES_PER_CHECKPOINT) {
         TIFFCheckpointDirectory (m_tif);
@@ -528,14 +550,17 @@ TIFFOutput::write_tile (int x, int y, int z,
     data = to_native_tile (format, data, xstride, ystride, zstride, m_scratch);
     if (m_planarconfig == PLANARCONFIG_SEPARATE && m_spec.nchannels > 1) {
         // Convert from contiguous (RGBRGBRGB) to separate (RRRGGGBBB)
-        int tile_pixels = m_spec.tile_width * m_spec.tile_height 
-                            * std::max (m_spec.tile_depth, 1);
-        int plane_bytes = tile_pixels * m_spec.format.size();
-        DASSERT (imagesize_t(plane_bytes*m_spec.nchannels) == m_spec.tile_bytes());
+        imagesize_t tile_pixels = m_spec.tile_pixels();
+        imagesize_t plane_bytes = tile_pixels * m_spec.format.size();
+        DASSERT (plane_bytes*m_spec.nchannels == m_spec.tile_bytes());
         m_scratch.resize (m_spec.tile_bytes());
         contig_to_separate (tile_pixels, (const unsigned char *)data, &m_scratch[0]);
-        for (int c = 0;  c < m_spec.nchannels;  ++c)
-            TIFFWriteTile (m_tif, (tdata_t)&m_scratch[plane_bytes*c], x, y, z, c);
+        for (int c = 0;  c < m_spec.nchannels;  ++c) {
+            if (TIFFWriteTile (m_tif, (tdata_t)&m_scratch[plane_bytes*c], x, y, z, c) < 0) {
+                error ("TIFFWriteTile failed");
+                return false;
+            }
+        }
     } else {
         // No contig->separate is necessary.  But we still use scratch
         // space since TIFFWriteTile is destructive when
@@ -545,7 +570,10 @@ TIFFOutput::write_tile (int x, int y, int z,
                               (unsigned char *)data + m_spec.tile_bytes());
             data = &m_scratch[0];
         }
-        TIFFWriteTile (m_tif, (tdata_t)data, x, y, z, 0);
+        if (TIFFWriteTile (m_tif, (tdata_t)data, x, y, z, 0) < 0) {
+            error ("TIFFWriteTile failed");
+            return false;
+        }
     }
     
     // Should we checkpoint? Only if we have enough tiles and enough time has passed

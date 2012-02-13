@@ -51,6 +51,7 @@ using namespace std::tr1;
 #include "strutil.h"
 #include "sysutil.h"
 #include "timer.h"
+#include "optparser.h"
 #include "imageio.h"
 #include "imagebuf.h"
 #include "imagecache.h"
@@ -311,7 +312,7 @@ ImageCacheFile::open (ImageCachePerThreadInfo *thread_info)
         return false;
 
     m_input.reset (ImageInput::create (m_filename.c_str(),
-                                       m_imagecache.searchpath().c_str()));
+                                       m_imagecache.plugin_searchpath().c_str()));
     if (! m_input) {
         imagecache().error ("%s", OIIO_NAMESPACE::geterror().c_str());
         m_broken = true;
@@ -366,7 +367,11 @@ ImageCacheFile::open (ImageCachePerThreadInfo *thread_info)
                 si.untiled = true;
                 if (imagecache().autotile()) {
                     // Automatically make it appear as if it's tiled
-                    tempspec.tile_width = imagecache().autotile();
+                    if (imagecache().autoscanline()) {
+                        tempspec.tile_width = pow2roundup (tempspec.width);
+                    } else {
+                        tempspec.tile_width = imagecache().autotile();
+                    }
                     tempspec.tile_height = imagecache().autotile();
                     if (tempspec.depth > 1)
                         tempspec.tile_depth = imagecache().autotile();
@@ -422,7 +427,11 @@ ImageCacheFile::open (ImageCachePerThreadInfo *thread_info)
                 s.full_height = h;
                 s.full_depth = d;
                 if (imagecache().autotile()) {
-                    s.tile_width = std::min (imagecache().autotile(), w);
+                    if (imagecache().autoscanline()) {
+                       s.tile_width = w;
+                    } else {
+                       s.tile_width = std::min (imagecache().autotile(), w);
+                    }
                     s.tile_height = std::min (imagecache().autotile(), h);
                     s.tile_depth = std::min (imagecache().autotile(), d);
                 } else {
@@ -493,7 +502,7 @@ ImageCacheFile::open (ImageCachePerThreadInfo *thread_info)
     }
 
     if ((p = spec.find_attribute ("wrapmodes", TypeDesc::STRING))) {
-        const char *wrapmodes = (const char *)p->data();
+        const char *wrapmodes = *(const char **)p->data();
         TextureOpt::parse_wrapmodes (wrapmodes, m_swrap, m_twrap);
         m_rwrap = m_swrap;
         // FIXME(volume) -- rwrap
@@ -1236,6 +1245,7 @@ ImageCacheImpl::init ()
     m_max_open_files = 100;
     m_max_memory_bytes = 256 * 1024 * 1024;   // 256 MB default cache size
     m_autotile = 0;
+    m_autoscanline = false;
     m_automip = false;
     m_forcefloat = false;
     m_accept_untiled = true;
@@ -1254,6 +1264,11 @@ ImageCacheImpl::init ()
     m_stat_open_files_peak = 0;
     m_tilemutex_holder = NULL;
     m_filemutex_holder = NULL;
+
+    // Allow environment variable to override default options
+    const char *options = getenv ("OPENIMAGEIO_IMAGECACHE_OPTIONS");
+    if (options)
+        attribute ("options", options);
 }
 
 
@@ -1561,6 +1576,9 @@ ImageCacheImpl::attribute (const std::string &name, TypeDesc type,
 {
     bool do_invalidate = false;
     bool force_invalidate = false;
+    if (name == "options" && type == TypeDesc::STRING) {
+        return optparser (*this, *(const char **)val);
+    }
     if (name == "max_open_files" && type == TypeDesc::INT) {
         m_max_open_files = *(const int *)val;
     }
@@ -1591,6 +1609,9 @@ ImageCacheImpl::attribute (const std::string &name, TypeDesc type,
             force_invalidate = true;
         }
     }
+    else if (name == "plugin_searchpath" && type == TypeDesc::STRING) {
+        m_plugin_searchpath = std::string (*(const char **)val);
+    }
     else if (name == "statistics:level" && type == TypeDesc::INT) {
         m_statslevel = *(const int *)val;
     }
@@ -1605,6 +1626,13 @@ ImageCacheImpl::attribute (const std::string &name, TypeDesc type,
 #endif
         if (a != m_autotile) {
             m_autotile = a;
+            do_invalidate = true;
+        }
+    }
+    else if (name == "autoscanline" && type == TypeDesc::INT) {
+        int a = *(const int *)val;
+        if (a != m_autoscanline) {
+            m_autoscanline = a;
             do_invalidate = true;
         }
     }
@@ -1679,6 +1707,7 @@ ImageCacheImpl::getattribute (const std::string &name, TypeDesc type,
     ATTR_DECODE ("max_memory_MB", int, m_max_memory_bytes/(1024*1024));
     ATTR_DECODE ("statistics:level", int, m_statslevel);
     ATTR_DECODE ("autotile", int, m_autotile);
+    ATTR_DECODE ("autoscanline", int, m_autoscanline);
     ATTR_DECODE ("automip", int, m_automip);
     ATTR_DECODE ("forcefloat", int, m_forcefloat);
     ATTR_DECODE ("accept_untiled", int, m_accept_untiled);
@@ -1689,6 +1718,10 @@ ImageCacheImpl::getattribute (const std::string &name, TypeDesc type,
     // The cases that don't fit in the simple ATTR_DECODE scheme
     if (name == "searchpath" && type == TypeDesc::STRING) {
         *(ustring *)val = m_searchpath;
+        return true;
+    }
+    if (name == "plugin_searchpath" && type == TypeDesc::STRING) {
+        *(ustring *)val = m_plugin_searchpath;
         return true;
     }
     if (name == "worldtocommon" && (type == TypeDesc::TypeMatrix ||
